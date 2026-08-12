@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-遮天TVBox九秘大师 · 4k69.com v20.0
-修复：正确的URL格式 ?link1=videos&page=category&id=XXX + 女优ID格式修复
+遮天TVBox九秘大师 · 4k69.com v21.0
+修复：预解析重定向 + Range请求支持 + 保留末尾斜杠
 
-【正确的URL格式】
-最新视频: ?link1=videos&page=latest&page_id=1
-分类:     ?link1=videos&page=category&id=BBW&page_id=1
-工作室:   ?link1=videos&page=studio&id=Brazzers&page_id=1
-女优:     ?link1=videos&page=pornstar&id=Riley+Reid&page_id=1
+【播放慢的原因】
+4kporno链接会302重定向到fpvcdn.com CDN节点：
+  https://www.4kporno.xxx/get_file/.../xxx_2160m.mp4/ 
+  → 302 → https://fpvcdn.com/.../xxx_2160m.mp4
+TVBox每次播放都要经历重定向，导致加载慢。
+
+【修复方案】
+1. detailContent中预解析HEAD请求，拿到真实CDN URL直接返回
+2. playerContent增加Range: bytes=0- header（视频播放器必需）
+3. 保留dlink解码URL末尾的/（去掉/会404）
 """
 
 import sys
@@ -136,6 +141,28 @@ class YuanTianShu:
                 time.sleep(delay * (i + 1))
         print("[源天书] 寻神源失败 [%s]: %s" % (url, last_err))
         return ""
+
+    def _resolve_redirect(self, url, timeout=8):
+        """
+        兵字秘 · 预解析重定向
+        对4kporno链接发送HEAD请求，直接拿到真实CDN URL
+        省去TVBox播放时的302跳转延迟
+        """
+        if not url or not url.startswith("http"):
+            return url
+        try:
+            h = {
+                "User-Agent": random.choice(self.ua_pool),
+                "Referer": self.siteUrl + "/",
+                "Accept": "*/*",
+            }
+            resp = self.session.head(url, headers=h, timeout=timeout, allow_redirects=True)
+            if resp.status_code in [200, 206] and resp.url != url:
+                print("[重定向解析] %s -> %s" % (url[:60], resp.url[:60]))
+                return resp.url
+        except Exception as e:
+            print("[重定向解析失败] %s: %s" % (url[:60], e))
+        return url
 
     def _clean_m3u8(self, content):
         if not content:
@@ -284,8 +311,15 @@ class Spider(YuanTianShu, Spider):
                 except:
                     continue
 
-        expanded = dict(all_sources)
-        for url in list(all_sources.values()):
+        # v21关键修复：预解析重定向，直接拿到真实CDN URL
+        resolved_sources = {}
+        for quality, url in all_sources.items():
+            resolved = self._resolve_redirect(url)
+            resolved_sources[quality] = resolved
+
+        # 多分辨率构造（基于已解析的URL）
+        expanded = dict(resolved_sources)
+        for url in list(resolved_sources.values()):
             m = re.search(r'_(\d+)m\.mp4', url)
             if m:
                 current_res = m.group(1)
@@ -299,16 +333,16 @@ class Spider(YuanTianShu, Spider):
         quality_order = ["4K", "2160P", "1080P", "HD", "720P", "480P", "360P", "SD", "AUTO", "未知"]
         for q in quality_order:
             if q in expanded:
-                episodes.append("%s$%s" % (q, self._full_url(expanded[q])))
+                episodes.append("%s$%s" % (q, expanded[q]))
         for q, url in expanded.items():
             if q not in quality_order:
-                episodes.append("%s$%s" % (q, self._full_url(url)))
+                episodes.append("%s$%s" % (q, url))
 
         play_url_str = "#".join(episodes) if episodes else ""
 
         source_type = "视频源"
         all_urls = list(expanded.values())
-        if any("4kporno" in u for u in all_urls):
+        if any("4kporno" in u or "fpvcdn" in u for u in all_urls):
             source_type = "4K直链"
         elif any("okcdn" in u for u in all_urls):
             source_type = "4K直链"
@@ -330,9 +364,10 @@ class Spider(YuanTianShu, Spider):
             if id.startswith("http://127.0.0.1"):
                 return {"parse": 0, "url": id, "header": ""}
 
-            header = "User-Agent=%s&Referer=%s/" % (random.choice(self.ua_pool), self.siteUrl)
+            # v21关键修复：增加Range支持（视频播放器必需）
+            header = "User-Agent=%s&Referer=%s/&Range=bytes=0-" % (random.choice(self.ua_pool), self.siteUrl)
 
-            if "4kporno" in id or "okcdn" in id:
+            if "4kporno" in id or "okcdn" in id or "fpvcdn" in id:
                 return {"parse": 0, "url": id, "header": header}
             if "embed" in id:
                 return {"parse": 1, "url": id, "header": ""}
@@ -435,7 +470,7 @@ class Spider(YuanTianShu, Spider):
             return [500, "application/json", json.dumps({"error": str(e)})]
 
     def isVideoFormat(self, url):
-        if "4kporno" in url or "okcdn" in url:
+        if "4kporno" in url or "okcdn" in url or "fpvcdn" in url:
             return True
         return any(url.endswith(ext) for ext in [".m3u8", ".mp4", ".flv", ".mkv", ".ts"])
 
