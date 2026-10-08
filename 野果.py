@@ -2,12 +2,17 @@
 # 野果短剧 TVBox 爬虫
 # 站点: https://yeguodj.com
 # API: https://www.yeguodj.com/api.php （AES-CBC 响应）
-# 封面: 需解密代理
-
+# 封面: pic.*.cn AES 密文，本地 MEDIA_KEY/IV 解密（不再依赖外部 token 代理）
+#
+# 密钥来源: ForwardWidget Yeguo_TuT.js
+#   API_KEY  = 2acf7e91e9864673
+#   API_IV   = 1c29882d3ddfcfd6
+#   MEDIA_KEY= f5d965df75336270
+#   MEDIA_IV = 97b60394abc2fbe1
 
 import json
 import base64
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 from base.spider import Spider
 
 try:
@@ -22,27 +27,40 @@ except Exception:
 class Spider(Spider):
     def init(self, extend=""):
         self.api_base = "https://www.yeguodj.com/api.php"
-        self.cover_proxy = "https://huangguo.wulii.de5.net"
-        self.cover_token = "hg8f3a2c91b7e04d6a"
+        # 保留外部代理作为可选回退；默认走本地解密
+        self.cover_proxy = ""
+        self.cover_token = ""
+        self.use_local_cover = True
 
         # ext: apiBase||coverProxy||coverToken
+        # 若传入 coverProxy，则改回外部代理模式
         if extend:
             parts = [p.strip() for p in extend.strip().split("||")]
             if len(parts) >= 1 and parts[0].startswith("http"):
                 self.api_base = parts[0].rstrip("/")
             if len(parts) >= 2 and parts[1]:
                 self.cover_proxy = parts[1].rstrip("/")
+                self.use_local_cover = False
             if len(parts) >= 3 and parts[2]:
                 self.cover_token = parts[2]
 
         self.api_key = b"2acf7e91e9864673"
         self.api_iv = b"1c29882d3ddfcfd6"
+        # 封面 AES-CBC 密钥（与 JS MEDIA_KEY / MEDIA_IV 一致）
+        self.media_key = b"f5d965df75336270"
+        self.media_iv = b"97b60394abc2fbe1"
 
         self.ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
         self.headers = {
             "User-Agent": self.ua,
             "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/json",
+            "Referer": "https://yeguodj.com/",
+            "Origin": "https://yeguodj.com"
+        }
+        self.img_headers = {
+            "User-Agent": self.ua,
+            "Accept": "image/*,*/*;q=0.8",
             "Referer": "https://yeguodj.com/",
             "Origin": "https://yeguodj.com"
         }
@@ -76,7 +94,6 @@ class Spider(Spider):
 
     def homeContent(self, filter):
         classes = [
-            {"type_id": "home", "type_name": "首页推荐"},
             {"type_id": "explore", "type_name": "发现"},
             {"type_id": "rank", "type_name": "排行榜"},
             {"type_id": "dushi", "type_name": "都市"},
@@ -226,6 +243,59 @@ class Spider(Spider):
             }
         return {"parse": 1, "url": id, "header": self.headers}
 
+    # ==================== 本地封面代理 ====================
+
+    def getProxyUrl(self, local=True):
+        """TVBox / 猫影视本地代理入口"""
+        try:
+            from com.github.catvod import Proxy as _CatProxy
+            return str(_CatProxy.getUrl(local)) + "?do=py"
+        except Exception:
+            pass
+        return "http://127.0.0.1:9978/proxy?do=py"
+
+    def localProxy(self, param):
+        """
+        壳发起图片请求时回调。
+        param 里通常有 url（base64 编码的原始加密封面地址）。
+        返回: [status, contentType, body_bytes]
+        """
+        try:
+            raw = param.get("url") or param.get("pic") or ""
+            if not raw:
+                return [404, "text/plain", b"missing url"]
+            # 兼容 base64 / 直接 url / 双重编码
+            try:
+                src = base64.b64decode(unquote(raw)).decode("utf-8", errors="ignore")
+            except Exception:
+                src = unquote(raw)
+            if not src.startswith("http"):
+                try:
+                    src = base64.b64decode(src).decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+            if not src.startswith("http"):
+                return [400, "text/plain", b"bad url"]
+
+            data = self._fetch_bytes(src)
+            if not data:
+                return [502, "text/plain", b"fetch fail"]
+
+            plain = self._decrypt_cover_bytes(data)
+            if not plain:
+                return [502, "text/plain", b"decrypt fail"]
+
+            ctype = "image/jpeg"
+            if plain[:3] == b"\x89PN":
+                ctype = "image/png"
+            elif plain[:3] == b"GIF":
+                ctype = "image/gif"
+            elif plain[:2] == b"\xff\xd8":
+                ctype = "image/jpeg"
+            return [200, ctype, plain]
+        except Exception as e:
+            return [500, "text/plain", str(e).encode("utf-8", errors="ignore")]
+
     # ==================== 内部 ====================
 
     def _num_or_str(self, v):
@@ -235,11 +305,13 @@ class Spider(Spider):
         except Exception:
             return s
 
-    def _aes_cbc_decrypt(self, b64_text):
+    def _aes_cbc_decrypt(self, b64_text, key=None, iv=None):
         if AES is None:
-            raise Exception("缺少 Crypto 库，无法解密 API")
+            raise Exception("缺少 Crypto 库，无法解密")
+        key = key or self.api_key
+        iv = iv or self.api_iv
         raw = base64.b64decode(b64_text)
-        cipher = AES.new(self.api_key, AES.MODE_CBC, self.api_iv)
+        cipher = AES.new(key, AES.MODE_CBC, iv)
         plain = cipher.decrypt(raw)
         # PKCS7 unpad
         pad = plain[-1]
@@ -248,6 +320,62 @@ class Spider(Spider):
         if 1 <= pad <= 16:
             plain = plain[:-pad]
         return plain.decode("utf-8", errors="ignore")
+
+    def _is_plain_image(self, data):
+        if not data or len(data) < 3:
+            return False
+        if data[0] == 0xFF and data[1] == 0xD8:
+            return True  # jpeg
+        if data[0] == 0x89 and data[1] == 0x50 and data[2] == 0x4E:
+            return True  # png
+        if data[0] == 0x47 and data[1] == 0x49 and data[2] == 0x46:
+            return True  # gif
+        return False
+
+    def _decrypt_cover_bytes(self, data):
+        """对封面二进制做 AES-CBC 解密；若已是明文图片则原样返回"""
+        if not data:
+            return b""
+        if self._is_plain_image(data):
+            return data
+        if AES is None:
+            return b""
+        try:
+            # 对齐 16 字节块
+            n = len(data) - (len(data) % 16)
+            if n < 16:
+                return b""
+            cipher = AES.new(self.media_key, AES.MODE_CBC, self.media_iv)
+            plain = cipher.decrypt(data[:n])
+            pad = plain[-1]
+            if isinstance(pad, int) and 1 <= pad <= 16:
+                plain = plain[:-pad]
+            if self._is_plain_image(plain):
+                return plain
+            # 有些实现不做 PKCS7，直接返回
+            if self._is_plain_image(plain + b""):
+                return plain
+            return plain if plain else b""
+        except Exception:
+            return b""
+
+    def _fetch_bytes(self, url):
+        try:
+            r = self.fetch(url, headers=self.img_headers)
+            if hasattr(r, "content"):
+                return r.content
+            if hasattr(r, "text"):
+                # 可能是 base64 文本
+                t = r.text
+                if t.startswith("data:"):
+                    t = t.split(",", 1)[-1]
+                try:
+                    return base64.b64decode(t)
+                except Exception:
+                    return t.encode("latin-1", errors="ignore")
+        except Exception:
+            pass
+        return b""
 
     def _api_post(self, path, body=None):
         url = self.api_base.rstrip("/") + path
@@ -297,8 +425,11 @@ class Spider(Spider):
         url = (url or "").strip()
         if not url:
             return ""
-        if not self.cover_proxy:
-            return url
+        # 本地解密代理（推荐，不依赖 token）
+        if self.use_local_cover or not self.cover_proxy:
+            b64 = base64.b64encode(url.encode("utf-8")).decode("utf-8")
+            return self.getProxyUrl() + "&url=" + quote(b64, safe="")
+        # 外部代理回退
         q = {"url": url}
         if self.cover_token:
             q["token"] = self.cover_token
