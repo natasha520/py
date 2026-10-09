@@ -85,7 +85,7 @@ except ImportError:
 
 class Spider(BaseSpider):
 
-    HOST = "https://91crdjai.com/"
+    HOST = "https://91crdjai.com"   # 注意：末尾不带斜杠，下方所有拼接处统一补 "/"
 
     UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
